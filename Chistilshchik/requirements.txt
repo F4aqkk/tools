@@ -1,0 +1,4 @@
+PyQt6>=6.6
+psutil>=5.9
+nvidia-ml-py>=12.535
+Send2Trash>=1.8
