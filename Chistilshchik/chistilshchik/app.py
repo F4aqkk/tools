@@ -1,22 +1,26 @@
-"""Запуск программы: значок в трее и простое окно.
+"""Запуск программы: значок в трее, окно и слежение за дисками.
 
-Этап 1: только скелет. Слежение за дисками, монитор нагрузки и сканер
-появятся на следующих этапах.
+Опрос дисков идёт в отдельном потоке, чтобы окно не подвисало,
+если какой-то диск отвечает медленно (например, спящий HDD).
 """
 import logging
 import sys
 import traceback
 
-import psutil
-from PyQt6.QtCore import QLockFile, Qt, QTimer
+from PyQt6.QtCore import (
+    QLockFile, QMetaObject, QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot,
+)
 from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QLabel, QMainWindow, QMenu, QMessageBox, QSystemTrayIcon,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QApplication, QHeaderView, QLabel, QMainWindow, QMenu, QMessageBox,
+    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import APP_NAME, __version__, config
+from . import tracker as tr
 from .db import Database
+from .disks import DRIVE_TYPE_NAMES
+from .utils import human_size
 
 # Цвета значка в трее (раздел 6 ТЗ)
 STATE_COLORS = {
@@ -29,6 +33,7 @@ STATE_TEXT = {
     "scanning": "Идёт проверка",
     "paused": "Пауза: ПК нагружен",
 }
+LOW_COLOR = QColor("#c0392b")
 
 
 def make_icon(state):
@@ -44,60 +49,99 @@ def make_icon(state):
     return QIcon(pix)
 
 
-def human_size(n):
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if n < 1024 or unit == "ТБ":
-            return f"{n:.0f} {unit}" if unit in ("Б", "КБ") else f"{n:.1f} {unit}"
-        n /= 1024
+class DiskWorker(QObject):
+    """Живёт в отдельном потоке и каждые несколько секунд опрашивает диски."""
+
+    disks_updated = pyqtSignal(list)              # список DiskInfo
+    disk_event = pyqtSignal(str, object, bool)    # вид, DiskInfo, новый ли
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+        self.tracker = None
+        self.timer = None
+
+    @pyqtSlot()
+    def start(self):
+        self.tracker = tr.DiskTracker(self.db)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.tick()
+        self.timer.start(self.db.get_int("disk_poll_sec") * 1000)
+
+    @pyqtSlot()
+    def stop(self):
+        if self.timer:
+            self.timer.stop()
+
+    @pyqtSlot()
+    def tick(self):
+        try:
+            events = self.tracker.poll()
+        except Exception:
+            logging.exception("Ошибка при опросе дисков")
+            return
+        for kind, disk, is_new in events:
+            self.disk_event.emit(kind, disk, is_new)
+        self.disks_updated.emit(self.tracker.connected())
+        # Интервал мог поменяться в настройках
+        interval = max(1, self.db.get_int("disk_poll_sec")) * 1000
+        if self.timer.interval() != interval:
+            self.timer.setInterval(interval)
 
 
 class MainWindow(QMainWindow):
+    COLUMNS = ["Диск", "Название", "Вид", "Тип", "Всего", "Свободно", "Свободно, %"]
+
     def __init__(self, db):
         super().__init__()
         self.db = db
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(560, 320)
+        self.resize(720, 340)
 
         self.status = QLabel()
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Диск", "Всего", "Свободно", "Свободно, %"])
+        self.low_label = QLabel()
+        self.low_label.setStyleSheet("color: #c0392b;")
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
         box = QWidget()
         lay = QVBoxLayout(box)
         lay.addWidget(self.status)
+        lay.addWidget(self.low_label)
         lay.addWidget(self.table)
         self.setCentralWidget(box)
-
         self.set_state("watching")
-        self.refresh_disks()
 
     def set_state(self, state):
         self.status.setText(f"Состояние: {STATE_TEXT[state]}")
 
-    def refresh_disks(self):
+    def show_disks(self, disks):
         threshold = self.db.get_int("free_threshold_pct")
-        rows = []
-        for part in psutil.disk_partitions(all=False):
-            if "cdrom" in part.opts or not part.fstype:
-                continue
-            try:
-                u = psutil.disk_usage(part.mountpoint)
-            except OSError:
-                continue
-            free_pct = u.free / u.total * 100 if u.total else 0
-            rows.append((part.device, u.total, u.free, free_pct))
-
-        self.table.setRowCount(len(rows))
-        for r, (dev, total, free, pct) in enumerate(rows):
-            cells = [dev, human_size(total), human_size(free), f"{pct:.0f}%"]
+        self.table.setRowCount(len(disks))
+        low = []
+        for r, d in enumerate(disks):
+            is_low = d.free_pct < threshold
+            if is_low:
+                low.append(d.letter)
+            cells = [
+                d.letter, d.label, DRIVE_TYPE_NAMES.get(d.drive_type, d.drive_type),
+                d.kind, human_size(d.total_bytes), human_size(d.free_bytes),
+                f"{d.free_pct:.0f}%",
+            ]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if pct < threshold:
-                    item.setForeground(QColor("#c0392b"))
+                if is_low:
+                    item.setForeground(LOW_COLOR)
                 self.table.setItem(r, c, item)
+        if low:
+            self.low_label.setText(f"Мало места (меньше {threshold}%): {', '.join(low)}")
+        else:
+            self.low_label.setText("")
 
     def closeEvent(self, event):
         # Крестик не закрывает программу, а прячет окно в трей
@@ -126,24 +170,51 @@ class App:
         self.tray.activated.connect(self.on_tray_click)
         self.tray.show()
 
-        # Пока просто обновляем таблицу дисков. На этапе 2 здесь будет
-        # настоящее слежение с автообнаружением новых дисков.
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.window.refresh_disks)
-        self.timer.start(self.db.get_int("disk_poll_sec") * 1000)
+        # Слежение за дисками в отдельном потоке
+        self.disk_thread = QThread()
+        self.disk_worker = DiskWorker(db)
+        self.disk_worker.moveToThread(self.disk_thread)
+        self.disk_thread.started.connect(self.disk_worker.start)
+        self.disk_worker.disks_updated.connect(self.window.show_disks)
+        self.disk_worker.disk_event.connect(self.on_disk_event)
+        self.disk_thread.start()
+
+    def notify(self, title, text, warning=False):
+        icon = (QSystemTrayIcon.MessageIcon.Warning if warning
+                else QSystemTrayIcon.MessageIcon.Information)
+        self.tray.showMessage(title, text, icon, 8000)
+
+    def on_disk_event(self, kind, disk, is_new):
+        if kind == tr.ADDED:
+            title = "Подключён новый диск" if is_new else "Подключён диск"
+            self.notify(title, tr.describe(disk))
+        elif kind == tr.LOW:
+            self.notify(
+                f"Диск {disk.letter} заполняется",
+                f"Свободно {disk.free_pct:.0f}% ({human_size(disk.free_bytes)}). "
+                "Поищу мусор, когда ПК будет свободен.",
+                warning=True,
+            )
+        # Отключение диска и «места снова хватает» только пишем в журнал,
+        # без всплывающих сообщений.
 
     def on_tray_click(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.show_window()
 
     def show_window(self):
-        self.window.refresh_disks()
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()
 
     def quit(self):
         self.db.log("Программа закрыта")
+        # Останавливаем таймер в его же потоке, потом сам поток
+        QMetaObject.invokeMethod(
+            self.disk_worker, "stop", Qt.ConnectionType.BlockingQueuedConnection
+        )
+        self.disk_thread.quit()
+        self.disk_thread.wait(3000)
         self.tray.hide()
         self.qt_app.quit()
 

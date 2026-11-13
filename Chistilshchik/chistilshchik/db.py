@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
--- Запомненные диски (3.3). volume_id = серийный номер тома,
+-- Запомненные диски (3.3). volume_id = постоянный номер тома,
 -- по нему отличаем новый диск от знакомого, даже если буква поменялась.
 CREATE TABLE IF NOT EXISTS disks (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS disks (
     total_bytes INTEGER,
     free_bytes  INTEGER,
     first_seen  TEXT NOT NULL,
-    last_seen   TEXT NOT NULL
+    last_seen   TEXT NOT NULL,
+    drive_type  TEXT,              -- fixed / removable / network / cdrom
+    connected   INTEGER NOT NULL DEFAULT 0
 );
 
 -- Место остановки проверки (раздел 8)
@@ -95,6 +97,7 @@ class Database:
     def _init(self):
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             # Настройки по умолчанию: добавляем только те, которых ещё нет
             self._conn.executemany(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -104,6 +107,14 @@ class Database:
                 "INSERT OR IGNORE INTO exclusions (path, kind, builtin) VALUES (?, ?, 1)",
                 config.builtin_exclusions(),
             )
+
+    def _migrate(self):
+        """Дописываем новые столбцы в базу, созданную старой версией."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(disks)")}
+        for col, decl in (("drive_type", "TEXT"),
+                          ("connected", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE disks ADD COLUMN {col} {decl}")
 
     def close(self):
         with self._lock:
@@ -161,6 +172,45 @@ class Database:
     def remove_exclusion(self, path):
         """Встроенные исключения удалить нельзя."""
         self.execute("DELETE FROM exclusions WHERE path = ? AND builtin = 0", (str(path),))
+
+    # ---------- диски ----------
+    def disk_count(self):
+        return self.query("SELECT COUNT(*) AS n FROM disks")[0]["n"]
+
+    def get_disk(self, volume_id):
+        rows = self.query("SELECT * FROM disks WHERE volume_id = ?", (volume_id,))
+        return rows[0] if rows else None
+
+    def all_disks(self):
+        return self.query("SELECT * FROM disks ORDER BY letter")
+
+    def upsert_disk(self, d):
+        """Запомнить диск или обновить его данные. d — DiskInfo."""
+        now = _now()
+        self.execute(
+            "INSERT INTO disks (volume_id, letter, label, fs_type, kind, total_bytes, "
+            "free_bytes, first_seen, last_seen, drive_type, connected) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(volume_id) DO UPDATE SET letter = excluded.letter, "
+            "label = excluded.label, fs_type = excluded.fs_type, kind = excluded.kind, "
+            "total_bytes = excluded.total_bytes, free_bytes = excluded.free_bytes, "
+            "last_seen = excluded.last_seen, drive_type = excluded.drive_type, connected = 1",
+            (d.volume_id, d.letter, d.label, d.fs_type, d.kind, d.total_bytes,
+             d.free_bytes, now, now, d.drive_type),
+        )
+
+    def set_connected(self, volume_id, connected):
+        self.execute(
+            "UPDATE disks SET connected = ?, last_seen = ? WHERE volume_id = ?",
+            (int(connected), _now(), volume_id),
+        )
+
+    def mark_all_disconnected(self):
+        self.execute("UPDATE disks SET connected = 0")
+
+    def disk_id(self, volume_id):
+        row = self.get_disk(volume_id)
+        return row["id"] if row else None
 
     # ---------- место остановки ----------
     def save_scan_state(self, disk_id, stage, last_dir, finished=False):
