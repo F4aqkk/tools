@@ -41,7 +41,7 @@ if not defined PY goto no_python
 rem ---------- 2. Виртуальное окружение ----------
 :venv
 echo [2/4] Создаю виртуальное окружение...
-%PY% -m venv .venv
+%PY% install.py venv
 if not exist "%VENV_PY%" goto no_venv
 
 rem ---------- 3. Библиотеки ----------
@@ -49,7 +49,7 @@ rem ---------- 3. Библиотеки ----------
 fc /b requirements.txt ".venv\requirements.installed" >nul 2>nul
 if not errorlevel 1 goto run
 echo [3/4] Ставлю библиотеки (нужен интернет)...
-"%VENV_PY%" -m pip install --disable-pip-version-check -r requirements.txt
+"%VENV_PY%" install.py deps
 if errorlevel 1 goto no_deps
 copy /y requirements.txt ".venv\requirements.installed" >nul
 
