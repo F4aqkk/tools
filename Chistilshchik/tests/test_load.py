@@ -32,10 +32,15 @@ class ReasonsTest(unittest.TestCase):
         self.assertEqual(ld.overload_reasons(sample(cpu=29), TH), [])
         self.assertEqual(ld.overload_reasons(sample(cpu=30), TH), ["процессор 30%"])
 
-    def test_two_hot_cores(self):
-        self.assertEqual(ld.overload_reasons(sample(hot_threads=1), TH), [])
-        self.assertEqual(ld.overload_reasons(sample(hot_threads=2), TH), ["2 ядра почти на 100%"])
+    def test_one_hot_core_is_enough(self):
+        self.assertEqual(ld.overload_reasons(sample(hot_threads=0), TH), [])
+        self.assertEqual(ld.overload_reasons(sample(hot_threads=1), TH), ["1 ядро почти на 100%"])
         self.assertEqual(ld.overload_reasons(sample(hot_threads=5), TH), ["5 ядер почти на 100%"])
+
+    def test_cores_count_from_settings(self):
+        th = ld.Thresholds(busy_cores_count=2)
+        self.assertEqual(ld.overload_reasons(sample(hot_threads=1), th), [])
+        self.assertEqual(ld.overload_reasons(sample(hot_threads=2), th), ["2 ядра почти на 100%"])
 
     def test_no_gpu_data_ignored(self):
         self.assertEqual(ld.overload_reasons(sample(gpu=None), TH), [])

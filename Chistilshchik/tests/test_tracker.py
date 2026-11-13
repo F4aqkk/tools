@@ -134,6 +134,20 @@ class TrackerTest(unittest.TestCase):
         self.assertEqual(calls, ["C:"])
         self.assertEqual(self.db.get_disk("vol-C")["kind"], "HDD")
 
+    def test_cores_default_upgraded_once(self):
+        """В старой базе стояло 2 ядра — должно стать 1. Но если человек
+        потом сам поставит 2, при следующем запуске не трогаем."""
+        self.assertEqual(self.db.get_int("busy_cores_count"), 1)
+        self.db.execute("UPDATE settings SET value = '2' WHERE key = 'busy_cores_count'")
+        self.db.execute("DELETE FROM settings WHERE key = 'settings_version'")
+        self.db.close()
+        self.db = Database(self.path)  # как будто запустили новую версию
+        self.assertEqual(self.db.get_int("busy_cores_count"), 1)
+        self.db.set_setting("busy_cores_count", 2)  # поменял руками в настройках
+        self.db.close()
+        self.db = Database(self.path)
+        self.assertEqual(self.db.get_int("busy_cores_count"), 2)
+
     def test_old_database_is_upgraded(self):
         """База от этапа 1 (без новых столбцов) должна открываться."""
         self.db.close()

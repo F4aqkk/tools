@@ -76,6 +76,9 @@ CREATE TABLE IF NOT EXISTS journal (
 """
 
 
+SETTINGS_VERSION = 1
+
+
 def _now():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -115,6 +118,25 @@ class Database:
                           ("connected", "INTEGER NOT NULL DEFAULT 0")):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE disks ADD COLUMN {col} {decl}")
+
+        # Смена настроек по умолчанию. Номер версии хранится в базе,
+        # каждый шаг выполняется один раз. Меняем значение, только если
+        # оно осталось старым по умолчанию (то есть его не трогали руками).
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'settings_version'"
+        ).fetchone()
+        version = int(row["value"]) if row else 0
+        if version < 1:
+            # 14.11.2026: пауза по ядрам с 1 ядра вместо 2
+            self._conn.execute(
+                "UPDATE settings SET value = '1' "
+                "WHERE key = 'busy_cores_count' AND value = '2'"
+            )
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('settings_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SETTINGS_VERSION),),
+        )
 
     def close(self):
         with self._lock:
