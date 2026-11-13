@@ -4,6 +4,10 @@ setlocal
 cd /d "%~dp0"
 title Chistilshchik
 
+rem PY хранит готовую команду запуска Python, например: py -3
+rem или "C:\Users\Андрей\...\python.exe" (в кавычках, поэтому без кавычек при вызове).
+rem Путь не считываем из вывода Python: при русских буквах в пути
+rem (папка пользователя «Андрей») он портится.
 set "PY="
 set "VENV_PY=.venv\Scripts\python.exe"
 set "VENV_PYW=.venv\Scripts\pythonw.exe"
@@ -14,19 +18,14 @@ if exist "%VENV_PY%" goto deps
 
 rem ---------- 1. Ищем Python ----------
 echo [1/4] Ищу Python...
-call :try_cmd py -3
-if not defined PY call :try_cmd python
-if not defined PY call :try_path "%LocalAppData%\Programs\Python\Python312\python.exe"
-if not defined PY call :try_path "%ProgramFiles%\Python312\python.exe"
+call :find_python
 if defined PY goto venv
 
 echo       Python не найден. Ставлю автоматически, это займёт пару минут...
 where winget >nul 2>nul
 if errorlevel 1 goto download
 winget install -e --id Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
-call :try_path "%LocalAppData%\Programs\Python\Python312\python.exe"
-if not defined PY call :try_path "%ProgramFiles%\Python312\python.exe"
-if not defined PY call :try_cmd py -3
+call :find_python
 if defined PY goto venv
 
 :download
@@ -36,13 +35,13 @@ if errorlevel 1 powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.Ser
 if not exist "%PY_SETUP%" goto no_python
 echo       Устанавливаю Python...
 "%PY_SETUP%" /quiet InstallAllUsers=0 PrependPath=1 Include_launcher=1
-call :try_path "%LocalAppData%\Programs\Python\Python312\python.exe"
+call :find_python
 if not defined PY goto no_python
 
 rem ---------- 2. Виртуальное окружение ----------
 :venv
 echo [2/4] Создаю виртуальное окружение...
-"%PY%" -m venv .venv
+%PY% -m venv .venv
 if not exist "%VENV_PY%" goto no_venv
 
 rem ---------- 3. Библиотеки ----------
@@ -69,6 +68,7 @@ exit /b 1
 :no_venv
 echo.
 echo ОШИБКА: не получилось создать виртуальное окружение.
+echo Попробуй удалить папку .venv рядом с start.bat и запустить ещё раз.
 pause
 exit /b 1
 
@@ -78,12 +78,20 @@ echo ОШИБКА: не получилось поставить библиоте
 pause
 exit /b 1
 
-rem ---------- Проверка: подходит ли найденный Python (нужен 3.10+) ----------
-:try_cmd
-for /f "usebackq delims=" %%i in (`%* -c "import sys;print(sys.executable) if sys.version_info[:2]>=(3,10) else None" 2^>nul`) do set "PY=%%i"
+rem ---------- Поиск подходящего Python (3.10 и новее) ----------
+:find_python
+call :check py -3
+if defined PY exit /b 0
+for %%v in (314 313 312 311 310) do if not defined PY call :check "%LocalAppData%\Programs\Python\Python%%v\python.exe"
+if defined PY exit /b 0
+for %%v in (314 313 312 311 310) do if not defined PY call :check "%ProgramFiles%\Python%%v\python.exe"
+if defined PY exit /b 0
+call :check python
 exit /b 0
 
-:try_path
-if not exist "%~1" exit /b 0
-for /f "usebackq delims=" %%i in (`""%~1" -c "import sys;print(sys.executable) if sys.version_info[:2]>=(3,10) else None"" 2^>nul`) do set "PY=%%i"
+rem Пробуем запустить; подходит, если Python ответил «версия годится» (код 0).
+rem Заглушка Microsoft Store вернёт ошибку, поэтому её не примем.
+:check
+%* -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)" >nul 2>nul
+if not errorlevel 1 set "PY=%*"
 exit /b 0
